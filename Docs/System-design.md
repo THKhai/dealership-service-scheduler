@@ -19,12 +19,16 @@ flowchart LR
     end
 
     advisor --> booker
-    advisor --- hoanTat
+    advisor ---- hoanTat
 
     booker --- datLich
     booker --- xemSlot
     booker --- xemLich
     booker --- huyLich
+
+    %% Invisible links keep the «extend» use cases to the right of Đặt lịch
+    datLich ~~~ goiY
+    datLich ~~~ taoXe
 
     datLich -.->|"«include»"| kiemTra
     xemSlot -.->|"«include»"| kiemTra
