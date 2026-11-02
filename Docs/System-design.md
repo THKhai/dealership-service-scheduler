@@ -1,7 +1,7 @@
 # The unified Service Scheduler
 
 ## 1. Overview & scope
-- A backend service for booking dealership service appointments. Each booking automatically reserves a suitable service bay and a qualified technician for the full service duration. Built as a .NET 8 modular monolith on PostgreSQL, with double-booking prevented at the database level.
+- A backend service for booking dealership service appointments. Each booking automatically reserves a suitable service bay and a qualified technician for the full service duration. Built as a .NET 10 modular monolith on PostgreSQL, with double-booking prevented at the database level.
 
 - In scope: book, view available slots, suggest alternative times, view / cancel / complete appointments. OpenAPI spec as the client stub.
 
@@ -119,7 +119,7 @@ flowchart TD
 flowchart TD
     client(["Client (stubbed)<br/><small>OpenAPI · .http · cURL</small>"])
 
-    subgraph api["Scheduler API · .NET 8"]
+    subgraph api["Scheduler API · .NET 10"]
         presentation["Presentation (API)<br/><small>Endpoints · Validation · ProblemDetails</small>"]
         business["Business (Application + Domain)<br/><small>Use cases · AvailabilityService · Rules</small>"]
         dataAccess["Data Access (Infrastructure)<br/><small>EF Core · Migrations · Conflict mapping</small>"]
@@ -393,7 +393,7 @@ Exclusion constraints are PostgreSQL-specific. On SQL Server, the equivalent wou
 - Base path `/api/v1`, JSON over HTTPS.
 - Timestamps are ISO 8601 with offset (`2026-11-10T09:00:00+07:00`). Stored as UTC, returned in the dealership's timezone.
 - Errors follow RFC 7807 ProblemDetails, extended with a stable machine-readable `code`.
-- `POST /appointments` requires an `Idempotency-Key` header (A-19).
+- `POST /appointments` requires an `Idempotency-Key` header ([8.4](#84-idempotency)).
 - State changes use explicit action endpoints (`/cancel`, `/complete`, `/no-show`) instead of `PATCH status`. Each maps to one domain transition with its own rules.
 
 ### 9.2 Endpoints
