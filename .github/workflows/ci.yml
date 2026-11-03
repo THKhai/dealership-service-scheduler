@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore
+
+      # TreatWarningsAsErrors also fails the build on vulnerable NuGet packages (NU1903).
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      # Integration tests use Testcontainers; the Ubuntu runner already has Docker.
+      - name: Test
+        run: dotnet test --configuration Release --no-build --logger "console;verbosity=normal"
