@@ -14,6 +14,7 @@ public interface IAppointmentRepository
 
     /// <summary>Saves a new appointment in its own transaction.</summary>
     /// <exception cref="Exceptions.SlotTakenException">An exclusion constraint rejected the insert.</exception>
+    /// <exception cref="Exceptions.DuplicateIdempotencyKeyException">The idempotency key was saved by a concurrent request.</exception>
     Task InsertAsync(Appointment appointment, CancellationToken ct);
 
     /// <summary>Saves a status change (cancel, complete, no-show).</summary>
