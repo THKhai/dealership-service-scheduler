@@ -1,0 +1,15 @@
+services:
+  postgres:
+    ports: !reset []
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Scheduler: "Host=postgres;Port=5432;Database=scheduler;Username=scheduler;Password=${POSTGRES_PASSWORD}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
