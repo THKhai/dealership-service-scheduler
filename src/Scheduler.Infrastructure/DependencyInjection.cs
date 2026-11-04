@@ -19,6 +19,9 @@ public static class DependencyInjection
         services.AddScoped<ICustomerRepository, CustomerRepository>();
         services.AddScoped<IVehicleRepository, VehicleRepository>();
 
+        // Used by /health/ready: runs a trivial query against the database.
+        services.AddHealthChecks().AddDbContextCheck<SchedulerDbContext>("database", tags: ["ready"]);
+
         return services;
     }
 

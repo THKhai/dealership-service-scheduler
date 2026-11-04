@@ -6,6 +6,9 @@ public interface IAppointmentRepository
 {
     Task<Appointment?> GetByIdAsync(Guid id, CancellationToken ct);
 
+    /// <summary>Read-only view with dealership, service, bay, technician and vehicle names.</summary>
+    Task<AppointmentDetails?> GetDetailsAsync(Guid id, CancellationToken ct);
+
     /// <summary>Idempotency check before booking (section 7, 8.4).</summary>
     Task<Appointment?> GetByIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct);
 

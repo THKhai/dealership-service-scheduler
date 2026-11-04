@@ -13,6 +13,24 @@ internal sealed class AppointmentRepository(SchedulerDbContext db) : IAppointmen
     public Task<Appointment?> GetByIdAsync(Guid id, CancellationToken ct) =>
         db.Appointments.FirstOrDefaultAsync(a => a.Id == id, ct);
 
+    public Task<AppointmentDetails?> GetDetailsAsync(Guid id, CancellationToken ct) =>
+        (from a in db.Appointments
+         join d in db.Dealerships on a.DealershipId equals d.Id
+         join s in db.ServiceTypes on a.ServiceTypeId equals s.Id
+         join b in db.ServiceBays on a.ServiceBayId equals b.Id
+         join t in db.Technicians on a.TechnicianId equals t.Id
+         join v in db.Vehicles on a.VehicleId equals v.Id
+         where a.Id == id
+         select new AppointmentDetails(
+             a.Id, a.Status, a.Channel, a.StartUtc, a.EndUtc,
+             d.Id, d.Name, d.TimeZone,
+             s.Id, s.Code, s.Name, s.DurationMinutes,
+             b.Id, b.Name,
+             t.Id, t.Name,
+             v.Vin))
+        .AsNoTracking()
+        .FirstOrDefaultAsync(ct);
+
     public Task<Appointment?> GetByIdempotencyKeyAsync(string idempotencyKey, CancellationToken ct) =>
         db.Appointments.AsNoTracking().FirstOrDefaultAsync(a => a.IdempotencyKey == idempotencyKey, ct);
 
