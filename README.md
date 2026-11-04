@@ -24,7 +24,29 @@ dotnet user-secrets set "ConnectionStrings:Scheduler" \
 dotnet run --project src/Scheduler.Api    # http://localhost:5057
 ```
 
-Then open [`requests/appointments.http`](requests/appointments.http) in Rider, Visual Studio or VS Code and run the requests top to bottom. The OpenAPI document is at `http://localhost:5057/openapi/v1.json`.
+## Trying the API
+
+**Rider / IntelliJ:** open [`requests/appointments.http`](requests/appointments.http) and click the green arrow next to each request, top to bottom. It covers every endpoint and most error codes; later requests reuse the ID of the booked appointment.
+
+**curl:**
+
+```bash
+curl http://localhost:5057/api/v1/service-types
+
+curl "http://localhost:5057/api/v1/dealerships/d0000000-0000-0000-0000-000000000001/availability?serviceTypeId=50000000-0000-0000-0000-000000000002&date=2026-11-20"
+
+curl -i -X POST http://localhost:5057/api/v1/appointments \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"dealershipId":"d0000000-0000-0000-0000-000000000001","serviceTypeId":"50000000-0000-0000-0000-000000000002",
+       "startTime":"2026-11-20T09:00:00+07:00","channel":"Online",
+       "customer":{"name":"Nguyen Van An","email":"an@example.com","phone":"+84901234567"},
+       "vehicle":{"vin":"1HGCM82633A004352","make":"Honda","model":"Civic","year":2021}}'
+```
+
+**Postman / Insomnia:** import `http://localhost:5057/openapi/v1.json`.
+
+To start again from clean seed data: `docker compose down -v && docker compose up -d`.
 
 **Everything in containers** (as on the server):
 

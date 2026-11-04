@@ -1,5 +1,6 @@
-# Client stub (section 9.6). Runs in Rider, Visual Studio or VS Code (REST Client extension).
-# Run the requests top to bottom: later ones reuse the appointment created by "book".
+# Client stub (section 9.6). Uses the JetBrains HTTP Client syntax: run it in Rider or IntelliJ
+# (green arrow next to each request). Without Rider: use the curl examples in the README.
+# Run the requests top to bottom: later ones reuse the appointment created by "Book an appointment".
 # Times must be in the future, at least 1 hour ahead for Online, on a 15-minute step,
 # inside opening hours (Mon-Sat 08:00-17:00 Asia/Ho_Chi_Minh). Change @day if it is in the past.
 
@@ -23,7 +24,6 @@ GET {{baseUrl}}/api/v1/dealerships/{{dealershipId}}/availability?serviceTypeId={
 GET {{baseUrl}}/api/v1/dealerships/{{dealershipId}}/availability?serviceTypeId={{brakeService}}&date={{day}}&channel=Advisor
 
 ### UC-01 Book an appointment -> 201 Created
-# @name book
 POST {{baseUrl}}/api/v1/appointments
 Content-Type: application/json
 Idempotency-Key: 7f3c2a1e-9b8d-4c6f-a2e1-1d5b9c0e4f77
@@ -36,6 +36,8 @@ Idempotency-Key: 7f3c2a1e-9b8d-4c6f-a2e1-1d5b9c0e4f77
   "customer": { "name": "Nguyen Van An", "email": "an@example.com", "phone": "+84901234567" },
   "vehicle": { "vin": "1HGCM82633A004352", "make": "Honda", "model": "Civic", "year": 2021 }
 }
+
+> {% client.global.set("appointmentId", response.body.id); %}
 
 ### Same Idempotency-Key and body again -> 200 OK with the same appointment
 POST {{baseUrl}}/api/v1/appointments
@@ -52,7 +54,7 @@ Idempotency-Key: 7f3c2a1e-9b8d-4c6f-a2e1-1d5b9c0e4f77
 }
 
 ### UC-03 View the appointment
-GET {{baseUrl}}/api/v1/appointments/{{book.response.body.id}}
+GET {{baseUrl}}/api/v1/appointments/{{appointmentId}}
 
 ### 409 VEHICLE_ALREADY_BOOKED: same car, overlapping time, new key
 POST {{baseUrl}}/api/v1/appointments
@@ -145,10 +147,10 @@ Content-Type: application/json
 {}
 
 ### UC-05 Complete the booked appointment
-POST {{baseUrl}}/api/v1/appointments/{{book.response.body.id}}/complete
+POST {{baseUrl}}/api/v1/appointments/{{appointmentId}}/complete
 
 ### 409 INVALID_STATUS_TRANSITION: a completed appointment cannot be cancelled
-POST {{baseUrl}}/api/v1/appointments/{{book.response.body.id}}/cancel
+POST {{baseUrl}}/api/v1/appointments/{{appointmentId}}/cancel
 
 ### 404 NOT_FOUND
 GET {{baseUrl}}/api/v1/appointments/00000000-0000-0000-0000-000000000000

@@ -532,7 +532,7 @@ A closed day returns an empty `slots` array with `"reason": "CLOSED"`. `channel`
 
 ### 9.6 Client Stub
 
-The OpenAPI document is generated from code and served at `/openapi/v1.json`; any OpenAPI generator (NSwag, Kiota, openapi-generator) can produce a typed client from it. The repository also includes `requests/appointments.http` with ready-to-run examples for every endpoint and most error cases, usable from Rider, Visual Studio or VS Code (REST Client).
+The OpenAPI document is generated from code and served at `/openapi/v1.json`; any OpenAPI generator (NSwag, Kiota, openapi-generator) can produce a typed client from it. The repository also includes `requests/appointments.http` with ready-to-run examples for every endpoint and most error cases (JetBrains HTTP Client: Rider or IntelliJ); the README has equivalent curl commands.
 
 ## 10. Technology Choices
 
