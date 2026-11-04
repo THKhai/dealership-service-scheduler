@@ -233,20 +233,21 @@ sequenceDiagram
     autonumber
     actor Client
     participant Presentation
-    participant Handler as BookAppointmentHandler
-    participant Availability as AvailabilityService
+    participant Handler as AppointmentService
+    participant Availability as SlotFinder / AvailabilityService
     participant Repositories as Repositories (EF Core)
     participant PostgreSQL
 
     Client->>Presentation: POST /api/v1/appointments (Idempotency-Key)
-    Presentation->>Presentation: Validate request shape
-    Presentation->>Repositories: Find appointment by Idempotency-Key
+    Presentation->>Presentation: Validate request shape (FluentValidation)
+    Presentation->>Handler: BookAppointmentCommand
+    Handler->>Repositories: Find appointment by Idempotency-Key
 
     break key already used
-        Presentation-->>Client: 200 OK (original appointment)
+        Handler-->>Presentation: Original appointment (replayed)
+        Presentation-->>Client: 200 OK
     end
 
-    Presentation->>Handler: BookAppointment command
     Handler->>Repositories: Load dealership, service type, opening hours
     Handler->>Handler: BookingPolicy.Validate(time)
 
@@ -263,13 +264,13 @@ sequenceDiagram
         Presentation-->>Client: 409 ProblemDetails
     end
 
-    Handler->>Availability: FindCandidates(dealership, serviceType, slot)
-    Availability->>Repositories: Load bays, qualified technicians, overlapping appointments
-    Repositories->>PostgreSQL: Single SELECT
+    Handler->>Repositories: Load snapshot: bays, qualified technicians, that day's bookings
+    Repositories->>PostgreSQL: SELECT (read-only, no locks)
+    Handler->>Availability: FindCandidates(snapshot, slot)
     Availability-->>Handler: Free bay/technician pairs (least-loaded first)
 
     break no candidates
-        Handler->>Availability: SuggestSlots(nearest to requested time)
+        Handler->>Availability: SuggestSlotsAsync(nearest to requested time)
         Handler-->>Presentation: NoCapacity + suggestions
         Presentation-->>Client: 409 ProblemDetails + suggested times
     end
@@ -292,25 +293,26 @@ sequenceDiagram
 
 ### 8.1 The Problem
 
-- Availability is checked and then written in two separate steps. Two requests for the last free slot can both pass the check:
-  
-|Time	|Request A	|Request B |
+Availability is checked and then written in two separate steps. Two requests for the last free slot can both pass the check:
+
+| Time | Request A | Request B |
 | --- | --- | --- |
-|t1	|Reads: Bay 1 + Alex free at 09:00	|
-|t2	|	|Reads: Bay 1 + Alex free at 09:00
-|t3	|Inserts appointment |	
-|t4	|   |Inserts appointment → double-booked
- - Application-level checks alone cannot prevent this. Correctness must be guaranteed at the point where data is written
+| t1 | Reads: Bay 1 + An free at 09:00 | |
+| t2 | | Reads: Bay 1 + An free at 09:00 |
+| t3 | Inserts appointment | |
+| t4 | | Inserts appointment → **double-booked** |
+
+Application-level checks alone cannot prevent this. Correctness must be guaranteed at the point where data is written.
 
 ### 8.2 Options Considered
 
-|Approach	|How	|Verdict\
+| Approach | How | Verdict |
 | --- | --- | --- |
-|Application check only	    |Check then insert	    |Race condition above
-|Pessimistic locking	|SELECT ... FOR UPDATE on candidate bay/technician rows before inserting	|Works, but holds locks while searching; lock ordering must be handled to avoid deadlocks
-|Serializable isolation	Run booking in a    |SERIALIZABLE transaction	|Works, but aborts many unrelated transactions under load; every caller must retry
-|Distributed lock (e.g. Redis)	    |Lock per resource across instances	    |Extra infrastructure; still needs a DB-level guarantee if the lock expires
-|Database exclusion constraints	    |PostgreSQL rejects overlapping intervals for the same resource	    |Chosen
+| Application check only | Check, then insert | Race condition above |
+| Pessimistic locking | `SELECT ... FOR UPDATE` on candidate bay/technician rows before inserting | Works, but holds locks while searching; lock ordering must be handled to avoid deadlocks |
+| Serializable isolation | Run the booking in a `SERIALIZABLE` transaction | Works, but aborts many unrelated transactions under load; every caller must retry |
+| Distributed lock (e.g. Redis) | Lock per resource across instances | Extra infrastructure; still needs a DB-level guarantee if the lock expires |
+| Database exclusion constraints | PostgreSQL rejects overlapping intervals for the same resource | **Chosen** |
 
 ### 8.3 Chosen Approach: Exclusion Constraints + Optimistic Retry
 
@@ -343,20 +345,30 @@ Each insert runs in its own short transaction. On PostgreSQL error `23P01`, the 
 | `ex_appointment_vehicle` | Vehicle was booked concurrently | Stop, return `409 VEHICLE_ALREADY_BOOKED` |
 | All candidates exhausted | Slot genuinely full | Return `409 NO_CAPACITY` with suggestions |
 
+Simplified from `AppointmentService.BookAsync`:
+
 ```csharp
-foreach (var (bay, technician) in candidates.Take(MaxAttempts))
+foreach (var candidate in candidates.Take(MaxAttempts))
 {
+    var appointment = Appointment.Confirm(dealership.Id, customer.Id, vehicle.Id, serviceType,
+        candidate.ServiceBayId, candidate.TechnicianId, command.Start, command.Channel,
+        command.CreatedBy, command.IdempotencyKey, now);
     try
     {
-        return await _appointments.InsertAsync(Appointment.Confirm(request, bay, technician));
+        await appointments.InsertAsync(appointment, ct);
+        return new BookingResult(await GetAsync(appointment.Id, ct), Replayed: false);
     }
     catch (SlotTakenException ex) when (ex.Resource is Resource.Bay or Resource.Technician)
     {
-        _metrics.BookingRetry();   // contention signal
+        SchedulerTelemetry.BookingRetries.Add(1);   // contention signal; try the next pair
     }
 }
-return BookingResult.NoCapacity(await _availability.SuggestSlots(request));
+
+var suggestions = await availability.SuggestSlotsAsync(dealership, serviceType, command.Start, command.Channel, ct);
+throw new NoCapacityException(limitingResource, suggestions);
 ```
+
+The repository translates `23P01` into `SlotTakenException` by constraint name, so the service never sees PostgreSQL error codes. After a failed insert it calls `ChangeTracker.Clear()`: otherwise the rejected entity stays tracked as `Added` and the next `SaveChanges` would try to insert it again.
 
 #### Why this approach
 
@@ -366,7 +378,14 @@ return BookingResult.NoCapacity(await _availability.SuggestSlots(request));
 
 ### 8.4 Idempotency
 
-`idempotency_key` has a unique index. If two identical requests race, one insert wins and the other hits the unique violation; the handler then returns the existing appointment. Clients can safely retry on timeouts.
+`idempotency_key` has a unique index. Clients can safely retry on timeouts:
+
+- **Sequential retry:** the key is found before booking, and the original appointment is returned with `200 OK`.
+- **Concurrent retry:** both requests pass the first lookup and race to insert. The loser is rejected either by the unique index (`23505`) or, because it books the same vehicle at the same time, by `ex_appointment_vehicle` (`23P01`). In both cases the service looks the key up again and returns the winner with `200 OK`; only when no appointment has that key is it a real `VEHICLE_ALREADY_BOOKED`.
+- **Same key, different booking:** `422 IDEMPOTENCY_KEY_REUSED`. The dealership, service type, start time and vehicle are compared with the stored appointment.
+- Registering a new customer (email) or vehicle (VIN) uses the same pattern: a unique violation means a concurrent request registered it first, so the existing row is used.
+
+Verified by a test that sends five parallel requests with one key: exactly one `201`, the rest `200`, and one row.
 
 ### 8.5 Read Consistency
 
@@ -380,7 +399,7 @@ An integration test using a real PostgreSQL instance (Testcontainers) sends N pa
 - all others `409`
 - exactly one `Confirmed` row in the database
 
-A second test with two free pairs asserts both requests succeed on different resources.
+A second test with two free pairs asserts both requests succeed on different resources. A third sends parallel retries with one `Idempotency-Key` ([8.4](#84-idempotency)). All three live in `tests/Scheduler.IntegrationTests/ConcurrencyTests.cs` and run in CI.
 
 ### 8.7 Trade-off: Database Portability
 
@@ -390,7 +409,8 @@ Exclusion constraints are PostgreSQL-specific. On SQL Server, the equivalent wou
 
 ### 9.1 Conventions
 
-- Base path `/api/v1`, JSON over HTTPS.
+- Base path `/api/v1`, JSON over HTTPS (TLS is terminated in front of the API, by a reverse proxy or tunnel).
+- IDs are UUIDs. Enums (`status`, `channel`, `limitingResource`) are strings.
 - Timestamps are ISO 8601 with offset (`2026-11-10T09:00:00+07:00`). Stored as UTC, returned in the dealership's timezone.
 - Errors follow RFC 7807 ProblemDetails, extended with a stable machine-readable `code`.
 - `POST /appointments` requires an `Idempotency-Key` header ([8.4](#84-idempotency)).
@@ -402,12 +422,14 @@ Exclusion constraints are PostgreSQL-specific. On SQL Server, the equivalent wou
 | --- | --- | --- | --- |
 | GET | `/dealerships` | Reference data | 200 |
 | GET | `/service-types` | Reference data | 200 |
-| GET | `/dealerships/{id}/availability?serviceTypeId=&date=&vin=` | UC-02 | 200 |
-| POST | `/appointments` | UC-01 | 201 |
+| GET | `/dealerships/{id}/availability?serviceTypeId=&date=&channel=` | UC-02 | 200 |
+| POST | `/appointments` | UC-01 | 201 (200 when the `Idempotency-Key` is replayed) |
 | GET | `/appointments/{id}` | UC-03 | 200 |
 | POST | `/appointments/{id}/cancel` | UC-04 | 200 |
 | POST | `/appointments/{id}/complete` | UC-05 | 200 |
 | POST | `/appointments/{id}/no-show` | UC-05 | 200 |
+
+Operational endpoints (outside `/api/v1`): `/health/live`, `/health/ready` and `/openapi/v1.json`.
 
 ### 9.3 Book Appointment
 
@@ -419,8 +441,8 @@ Idempotency-Key: 7f3c2a1e-9b8d-4c6f-a2e1-1d5b9c0e4f77
 Content-Type: application/json
 
 {
-  "dealershipId": "d1",
-  "serviceTypeId": "brake-service",
+  "dealershipId": "d0000000-0000-0000-0000-000000000001",
+  "serviceTypeId": "50000000-0000-0000-0000-000000000002",
   "startTime": "2026-11-10T09:00:00+07:00",
   "channel": "Online",
   "customer": { "name": "Nguyen Van An", "email": "an@example.com", "phone": "+84901234567" },
@@ -433,22 +455,26 @@ Customers are matched by email and vehicles by VIN; unknown ones are registered 
 #### 201 Created
 
 ```http
-Location: /api/v1/appointments/a9e4...
+Location: /api/v1/appointments/87135a65-4ac9-4e80-bb06-3a330a343614
+traceparent: 00-aeaece4990b0b4348c388002a00ff443-45b62cb058f3d691-01
 ```
 
 ```json
 {
-  "id": "a9e4...",
+  "id": "87135a65-4ac9-4e80-bb06-3a330a343614",
   "status": "Confirmed",
+  "channel": "Online",
   "start": "2026-11-10T09:00:00+07:00",
   "end": "2026-11-10T10:30:00+07:00",
-  "dealership":  { "id": "d1", "name": "Keyloop Motors District 1" },
-  "serviceType": { "id": "brake-service", "name": "Brake service", "durationMinutes": 90 },
-  "serviceBay":  { "id": "b1", "name": "Bay 1" },
-  "technician":  { "id": "t3", "name": "Chi" },
+  "dealership":  { "id": "d0000000-0000-0000-0000-000000000001", "name": "Keyloop Motors District 1" },
+  "serviceType": { "id": "50000000-0000-0000-0000-000000000002", "code": "brake-service", "name": "Brake service", "durationMinutes": 90 },
+  "serviceBay":  { "id": "b0000000-0000-0000-0000-000000000001", "name": "Bay 1" },
+  "technician":  { "id": "70000000-0000-0000-0000-000000000001", "name": "An" },
   "vehicle":     { "vin": "1HGCM82633A004352" }
 }
 ```
+
+A replayed `Idempotency-Key` returns the same body with `200 OK`.
 
 #### 409 Conflict (no capacity)
 
@@ -458,25 +484,26 @@ Location: /api/v1/appointments/a9e4...
   "title": "No capacity for the requested time",
   "status": 409,
   "code": "NO_CAPACITY",
-  "detail": "No qualified technician is free for 09:00–10:30.",
+  "detail": "No technician is free for the requested time.",
+  "instance": "/api/v1/appointments",
   "limitingResource": "Technician",
   "suggestedSlots": ["2026-11-10T10:30:00+07:00", "2026-11-10T11:00:00+07:00", "2026-11-10T13:00:00+07:00"],
   "traceId": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 }
 ```
 
-`traceId` links every error to its trace (see [Observability](#11-observability)).
+`suggestedSlots` are the three free start times nearest to the requested one, searched over the requested day and the six days after it. `traceId` links every error to its trace (see [Observability](#11-observability)).
 
 ### 9.4 View Available Slots
 
 ```http
-GET /api/v1/dealerships/d1/availability?serviceTypeId=brake-service&date=2026-11-10
+GET /api/v1/dealerships/d0000000-0000-0000-0000-000000000001/availability?serviceTypeId=50000000-0000-0000-0000-000000000002&date=2026-11-10
 ```
 
 ```json
 {
   "date": "2026-11-10",
-  "serviceTypeId": "brake-service",
+  "serviceTypeId": "50000000-0000-0000-0000-000000000002",
   "durationMinutes": 90,
   "slots": [
     { "start": "2026-11-10T08:00:00+07:00", "end": "2026-11-10T09:30:00+07:00" },
@@ -485,7 +512,7 @@ GET /api/v1/dealerships/d1/availability?serviceTypeId=brake-service&date=2026-11
 }
 ```
 
-A closed day returns an empty `slots` array with `"reason": "CLOSED"`.
+A closed day returns an empty `slots` array with `"reason": "CLOSED"`. `channel` defaults to `Online`, which hides starts inside the one-hour lead time; `channel=Advisor` shows them (A-06).
 
 ### 9.5 Error Codes
 
@@ -505,7 +532,7 @@ A closed day returns an empty `slots` array with `"reason": "CLOSED"`.
 
 ### 9.6 Client Stub
 
-The OpenAPI document is generated from code and served at `/swagger`. The repository also includes `requests/appointments.http` with ready-to-run examples for every endpoint and error case, usable from VS Code, Rider or cURL.
+The OpenAPI document is generated from code and served at `/openapi/v1.json`; any OpenAPI generator (NSwag, Kiota, openapi-generator) can produce a typed client from it. The repository also includes `requests/appointments.http` with ready-to-run examples for every endpoint and most error cases, usable from Rider, Visual Studio or VS Code (REST Client).
 
 ## 10. Technology Choices
 
@@ -518,7 +545,7 @@ The OpenAPI document is generated from code and served at `/swagger`. The reposi
 | Validation | FluentValidation | Validation rules kept separate from DTOs and unit-testable | DataAnnotations (harder to express cross-field rules) |
 | Time | `TimeProvider` (built-in) | Business rules depend on "now" (lead time, past dates); a fake clock makes them deterministic in tests | Custom `IClock` interface |
 | Logging | Serilog (JSON to stdout) | Structured logs with enrichment (correlation ID, trace ID); stdout fits containers | Built-in `ILogger` only |
-| Tracing & metrics | OpenTelemetry → Jaeger, Prometheus | Vendor-neutral standard; built-in instrumentation for ASP.NET Core, HttpClient and EF Core | Vendor APM agents (lock-in) |
+| Tracing & metrics | OpenTelemetry → Jaeger, Prometheus | Vendor-neutral standard; stable instrumentation for ASP.NET Core and Npgsql (every SQL command is a span) | Vendor APM agents (lock-in) |
 | API contract | Built-in OpenAPI + `.http` files | Contract generated from code stays in sync; `.http` files act as the client stub | Postman collection |
 | Testing | xUnit + Testcontainers | Integration tests run against a real PostgreSQL, the only way to verify exclusion constraints and concurrency | EF Core InMemory provider (cannot enforce constraints, would give false confidence) |
 | Local run | Docker Compose | One command starts API, PostgreSQL, Jaeger and Prometheus | Manual setup |
@@ -534,19 +561,19 @@ Serilog writes structured JSON to stdout.
 
 | Aspect | Approach |
 | --- | --- |
-| Standard fields | `traceId`, `spanId`, `correlationId`, `dealershipId`, `appointmentId` (when known) |
-| Business events | `Information`: `AppointmentBooked`, `BookingRejected {code}`, `AppointmentCancelled` |
+| Standard fields | trace ID (`@tr`), span ID (`@sp`), `RequestId`, `RequestPath`; `DealershipId`, `AppointmentId` when known |
+| Business events | `Information`: `AppointmentBooked`, `BookingRejected {Code}`, `AppointmentCancelled` / `Completed` / `NoShow` |
 | Contention | `Information` per retry; `Warning` when all candidates are exhausted under contention |
 | Failures | `Error` for unhandled exceptions, with stack trace |
 | Privacy | No customer name, email or phone in logs; VIN masked to last 6 characters |
 
 ### 11.2 Metrics
 
-Custom meter `Scheduler`, scraped by Prometheus from `/metrics`:
+Custom meter `Scheduler`, pushed over OTLP to Prometheus' OTLP receiver (no `/metrics` endpoint to expose or secure). Everything uses `System.Diagnostics.Metrics` and `ActivitySource`, which are built into .NET, so the Application layer has no OpenTelemetry dependency:
 
 | Metric | Type | Tags | Answers |
 | --- | --- | --- | --- |
-| `scheduler.bookings` | Counter | `result` (`created`, `no_capacity`, `vehicle_booked`, `invalid`), `channel`, `dealership` | Booking success rate; which dealerships run out of capacity |
+| `scheduler.bookings` | Counter | `result` (`created`, `replayed`, `no_capacity`, `vehicle_booked`, `invalid`), `channel`, `dealership` | Booking success rate; which dealerships run out of capacity |
 | `scheduler.booking.retries` | Counter | `dealership` | How often concurrent requests collide ([section 8](#8-concurrency-and-consistency)) |
 | `scheduler.booking.duration` | Histogram | `result` | End-to-end booking latency |
 | `scheduler.availability.duration` | Histogram | — | Cost of slot calculation |
@@ -561,8 +588,8 @@ Some metrics double as business signals: a rising `no_capacity` rate for a deale
 | Span | Source | Key attributes |
 | --- | --- | --- |
 | HTTP request | ASP.NET Core auto-instrumentation | route, status code |
-| SQL queries | EF Core auto-instrumentation | statement, duration |
-| `Booking.Validate` | Custom | rule violated (if any) |
+| SQL commands | Npgsql instrumentation | statement, duration |
+| `Booking.Validate` | Custom | wraps the `BookingPolicy` rule checks |
 | `Availability.FindCandidates` | Custom | candidate count |
 | `Booking.Insert` | Custom, one per attempt | attempt number, outcome (`committed` / `slot_taken`) |
 
@@ -570,8 +597,8 @@ The `traceId` is returned in every error response ([section 9.3](#93-book-appoin
 
 ### 11.4 Health Checks
 
-- `/health/live`: process is running.
-- `/health/ready`: database is reachable. Used by the orchestrator to stop routing traffic during outages.
+- `/health/live`: process is running (no checks, so a database outage does not get the process restarted).
+- `/health/ready`: database is reachable (EF Core `DbContext` check). Used by the orchestrator to stop routing traffic during outages.
 
 ### 11.5 Alerts (examples)
 
@@ -584,7 +611,7 @@ The `traceId` is returned in every error response ([section 9.3](#93-book-appoin
 
 ### 11.6 Local Setup
 
-`docker compose up` starts the API with Jaeger (traces at `localhost:16686`) and Prometheus (metrics at `localhost:9090`). Dashboards in Grafana are future work.
+`docker compose up -d` starts PostgreSQL, Jaeger (traces at `localhost:16686`) and Prometheus (metrics at `localhost:9090`); the API run with `dotnet run` exports to them (endpoints in `appsettings.Development.json`). Adding `-f docker-compose.prod.yml` also runs the API in a container, wired to the same services. Exporters are only enabled when an endpoint is configured, so tests run without them. Dashboards in Grafana are future work.
 
 ## 12. Scalability & Future Work
 
@@ -594,7 +621,7 @@ The `traceId` is returned in every error response ([section 9.3](#93-book-appoin
 | --- | --- |
 | More API traffic | The API is stateless; run multiple instances behind a load balancer. Correctness does not depend on instance count, because the database arbitrates conflicts ([section 8](#8-concurrency-and-consistency)). |
 | Read-heavy availability queries | Cache reference data (dealerships, service types, opening hours) in memory with a short TTL. Route availability reads to a read replica; slight staleness is acceptable since results are already a snapshot (A-09). |
-| Large `appointment` table | Partition `appointment` by dealership. Bays and technicians belong to one dealership, so their exclusion constraints stay valid within a partition. Trade-off: the cross-dealership vehicle constraint (A-07) would no longer be enforceable by a single constraint and would move to an application check guarded by a per-vehicle advisory lock. |
+| Large `appointment` table | Partition `appointment` by `dealership_id`. PostgreSQL only allows unique and exclusion constraints on a partitioned table when they include the partition key, so the bay and technician constraints become `EXCLUDE (dealership_id WITH =, service_bay_id WITH =, slot WITH &&)`. That is equivalent, because bays and technicians belong to one dealership. The idempotency index becomes `(dealership_id, idempotency_key)`. Trade-off: the vehicle constraint (A-07) spans dealerships, so it can no longer be one constraint; it would move to an application check guarded by a per-vehicle advisory lock. |
 | Multi-tenancy (dealer groups) | Add `tenant_id` to all tables with PostgreSQL row-level security, so tenants cannot read each other's data even if a query forgets a filter. |
 | Database availability | Managed PostgreSQL with automatic failover; idempotency keys make client retries safe across failovers. |
 
@@ -610,6 +637,9 @@ The `traceId` is returned in every error response ([section 9.3](#93-book-appoin
 | Smarter assignment | Balance workload across the day, prefer specialists, configurable buffer between jobs |
 | Rate limiting | Protect booking and availability endpoints from abuse |
 | Dashboards | Grafana over the metrics in [section 11](#11-observability) |
+| Repair orders & invoicing | Hand a completed appointment to the dealer management system |
+| Concurrent status changes | Two simultaneous transitions on one appointment (e.g. cancel and complete) are last-writer-wins today; add PostgreSQL's `xmin` as an EF Core concurrency token and return `409` on conflict |
+| Configurable rules per dealership | `BookingRules` (step, lead time, horizon) is global configuration today |
 
 ## 13. GenAI-Assisted Design
 
@@ -631,7 +661,7 @@ Requirements and test cases the AI had already drafted were treated as provision
 | --- | --- | --- |
 | Initial scope treated "Service Advisor" only as a second booker | Asked what a service advisor actually does for a customer | Added walk-in bookings without lead time, a `NoShow` status, and booking channel for auditing |
 | First Overview and Assumptions: about 20 assumptions explaining dealership basics | Reviewers are domain experts; only behaviour-changing decisions belong there | Cut to 10 assumptions using the rule "include it only if changing it would change the code" |
-| Data flow assumed to mean a sequence diagram | Questioned the choice; compared DFD, flowchart and sequence diagram | Kept sequence diagrams for API flows, with the reasoning documented |
+| Data flow assumed to mean a sequence diagram | Questioned the choice; compared DFD, flowchart and sequence diagram | Kept a sequence diagram for the booking flow ([section 7](#7-data-flow)): the order of calls across layers matters most there, and a DFD cannot show it |
 | Separate `NO_BAY_AVAILABLE` / `NO_TECHNICIAN_AVAILABLE` errors | Simplified client handling | Single `NO_CAPACITY` code with a `limitingResource` field |
 | Proposed .NET 8 | Checked against the current support lifecycle | Switched to .NET 10 LTS (.NET 8 support ends November 2026) |
 

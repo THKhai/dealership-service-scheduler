@@ -8,6 +8,8 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ConnectionStrings__Scheduler: "Host=postgres;Port=5432;Database=scheduler;Username=scheduler;Password=${POSTGRES_PASSWORD}"
+      Otel__TracesEndpoint: "http://jaeger:4317"
+      Otel__MetricsEndpoint: "http://prometheus:9090/api/v1/otlp/v1/metrics"
     depends_on:
       postgres:
         condition: service_healthy

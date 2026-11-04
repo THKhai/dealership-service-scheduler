@@ -1,0 +1,160 @@
+# Client stub (section 9.6). Runs in Rider, Visual Studio or VS Code (REST Client extension).
+# Run the requests top to bottom: later ones reuse the appointment created by "book".
+# Times must be in the future, at least 1 hour ahead for Online, on a 15-minute step,
+# inside opening hours (Mon-Sat 08:00-17:00 Asia/Ho_Chi_Minh). Change @day if it is in the past.
+
+@baseUrl = http://localhost:5057
+@dealershipId = d0000000-0000-0000-0000-000000000001
+@oilChange = 50000000-0000-0000-0000-000000000001
+@brakeService = 50000000-0000-0000-0000-000000000002
+@evBatteryCheck = 50000000-0000-0000-0000-000000000003
+@day = 2026-11-20
+
+### Reference data: dealerships with opening hours
+GET {{baseUrl}}/api/v1/dealerships
+
+### Reference data: service types
+GET {{baseUrl}}/api/v1/service-types
+
+### UC-02 Available start times for a brake service
+GET {{baseUrl}}/api/v1/dealerships/{{dealershipId}}/availability?serviceTypeId={{brakeService}}&date={{day}}
+
+### UC-02 Advisor view (no online lead time)
+GET {{baseUrl}}/api/v1/dealerships/{{dealershipId}}/availability?serviceTypeId={{brakeService}}&date={{day}}&channel=Advisor
+
+### UC-01 Book an appointment -> 201 Created
+# @name book
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 7f3c2a1e-9b8d-4c6f-a2e1-1d5b9c0e4f77
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{brakeService}}",
+  "startTime": "{{day}}T09:00:00+07:00",
+  "channel": "Online",
+  "customer": { "name": "Nguyen Van An", "email": "an@example.com", "phone": "+84901234567" },
+  "vehicle": { "vin": "1HGCM82633A004352", "make": "Honda", "model": "Civic", "year": 2021 }
+}
+
+### Same Idempotency-Key and body again -> 200 OK with the same appointment
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 7f3c2a1e-9b8d-4c6f-a2e1-1d5b9c0e4f77
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{brakeService}}",
+  "startTime": "{{day}}T09:00:00+07:00",
+  "channel": "Online",
+  "customer": { "name": "Nguyen Van An", "email": "an@example.com", "phone": "+84901234567" },
+  "vehicle": { "vin": "1HGCM82633A004352", "make": "Honda", "model": "Civic", "year": 2021 }
+}
+
+### UC-03 View the appointment
+GET {{baseUrl}}/api/v1/appointments/{{book.response.body.id}}
+
+### 409 VEHICLE_ALREADY_BOOKED: same car, overlapping time, new key
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 0b1c7d52-2f0e-4c55-9d43-31f1a8f5e001
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{oilChange}}",
+  "startTime": "{{day}}T10:00:00+07:00",
+  "channel": "Online",
+  "customer": { "name": "Nguyen Van An", "email": "an@example.com", "phone": "+84901234567" },
+  "vehicle": { "vin": "1HGCM82633A004352", "make": "Honda", "model": "Civic", "year": 2021 }
+}
+
+### Fill the only EV bay at 13:00 -> 201
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 0b1c7d52-2f0e-4c55-9d43-31f1a8f5e002
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{evBatteryCheck}}",
+  "startTime": "{{day}}T13:00:00+07:00",
+  "channel": "Advisor",
+  "customer": { "name": "Tran Thi Binh", "email": "binh@example.com", "phone": "+84907654321" },
+  "vehicle": { "vin": "5YJ3E1EA7KF317000", "make": "Tesla", "model": "Model 3", "year": 2019 }
+}
+
+### 409 NO_CAPACITY with limitingResource and suggestedSlots
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 0b1c7d52-2f0e-4c55-9d43-31f1a8f5e003
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{evBatteryCheck}}",
+  "startTime": "{{day}}T13:00:00+07:00",
+  "channel": "Online",
+  "customer": { "name": "Le Van Chi", "email": "chi@example.com", "phone": "+84909999999" },
+  "vehicle": { "vin": "WVWZZZ1KZAW000001", "make": "VW", "model": "ID.4", "year": 2023 }
+}
+
+### 422 OUTSIDE_OPENING_HOURS: 16:00 + 90 min ends after 17:00
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 0b1c7d52-2f0e-4c55-9d43-31f1a8f5e004
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{brakeService}}",
+  "startTime": "{{day}}T16:00:00+07:00",
+  "channel": "Online",
+  "customer": { "name": "Le Van Chi", "email": "chi@example.com", "phone": "+84909999999" },
+  "vehicle": { "vin": "WVWZZZ1KZAW000001", "make": "VW", "model": "ID.4", "year": 2023 }
+}
+
+### 422 INVALID_TIME: not on a 15-minute step
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 0b1c7d52-2f0e-4c55-9d43-31f1a8f5e005
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{brakeService}}",
+  "startTime": "{{day}}T09:10:00+07:00",
+  "channel": "Online",
+  "customer": { "name": "Le Van Chi", "email": "chi@example.com", "phone": "+84909999999" },
+  "vehicle": { "vin": "WVWZZZ1KZAW000001", "make": "VW", "model": "ID.4", "year": 2023 }
+}
+
+### 422 VALIDATION_FAILED: bad VIN and email
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+Idempotency-Key: 0b1c7d52-2f0e-4c55-9d43-31f1a8f5e006
+
+{
+  "dealershipId": "{{dealershipId}}",
+  "serviceTypeId": "{{brakeService}}",
+  "startTime": "{{day}}T09:00:00+07:00",
+  "channel": "Online",
+  "customer": { "name": "Le Van Chi", "email": "not-an-email", "phone": "+84909999999" },
+  "vehicle": { "vin": "BAD", "make": "VW", "model": "ID.4", "year": 2023 }
+}
+
+### 400 MALFORMED_REQUEST: missing Idempotency-Key
+POST {{baseUrl}}/api/v1/appointments
+Content-Type: application/json
+
+{}
+
+### UC-05 Complete the booked appointment
+POST {{baseUrl}}/api/v1/appointments/{{book.response.body.id}}/complete
+
+### 409 INVALID_STATUS_TRANSITION: a completed appointment cannot be cancelled
+POST {{baseUrl}}/api/v1/appointments/{{book.response.body.id}}/cancel
+
+### 404 NOT_FOUND
+GET {{baseUrl}}/api/v1/appointments/00000000-0000-0000-0000-000000000000
+
+### Health
+GET {{baseUrl}}/health/ready
+
+### OpenAPI document
+GET {{baseUrl}}/openapi/v1.json
