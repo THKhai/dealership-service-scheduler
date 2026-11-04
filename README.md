@@ -117,6 +117,38 @@ Details and the alternatives considered: [section 8](Docs/System-design.md#8-con
 - **Metrics**: OpenTelemetry to Prometheus (`http://localhost:9090`): bookings by result, retries (contention), latency, status transitions.
 - Every response carries a `traceparent` header, and every error body a matching `traceId`.
 
+## AI Collaboration Narrative
+
+I used Claude throughout the project, for both the design and the implementation. The full account, with concrete examples, is in [section 13 of the design document](Docs/System-design.md#13-genai-assisted-design).
+
+### Strategy: AI drafts, I decide
+
+- **I set the method, not the AI.** The AI's first instinct was to jump to a technical solution (stack, constraints, endpoints). I made it follow the order I trust: business process → use cases → three-layer architecture → sequence diagrams → code. Anything it had drafted earlier was treated as provisional and re-derived from the business process.
+- **I owned every decision.** The AI produced options, drafts and diagrams quickly; scope, trade-offs and design choices were mine. For example, I chose PostgreSQL exclusion constraints over locking only after comparing the alternatives ([section 8.2](Docs/System-design.md#82-options-considered)).
+- **Small steps, explained before moving on.** Implementation went step by step: domain, rules, repositories, services, API, tests, observability. For each step I asked why each part was there, and did not move on until I could explain and change it myself.
+- **Domain questions before code.** Asking "what does a service advisor actually do?" added walk-in bookings without lead time, a `NoShow` status and the booking channel, which neither the brief nor the AI's first draft contained.
+
+### Verifying and refining the output
+
+| Check | What it caught |
+| --- | --- |
+| **Challenge assumptions** | A proposed .NET 8 runtime (support ends November 2026), so I switched to .NET 10 LTS; about 20 assumptions cut to the 10 that change behaviour; two error codes merged into one `NO_CAPACITY` with a `limitingResource` field |
+| **See it work before accepting it** | I did not accept the exclusion-constraint design until a step-by-step simulation of two concurrent requests showed the race and how the constraint resolves it |
+| **Rewrite core logic myself** | I rewrote `BookingRules` and `BookingPolicy` by hand; the unit tests caught two bugs in my version (`Validate` never called the checks, and `Microsecond` was used instead of `Millisecond`) |
+| **Tests against a real database** | Designing the parallel-retry concurrency test exposed an idempotency race in AI-written code: the vehicle constraint could fire before the idempotency index, returning `409` instead of replaying the booking |
+| **Run it like a user** | Running the app and the client stub by hand found issues no automated test would: the `.http` file used the wrong IDE syntax, a Kerberos warning in the container logs, and an architecture diagram that did not match the code |
+
+### Ensuring final quality
+
+- **Correctness is enforced by the database, not by trust in the code.** Double-booking is prevented by PostgreSQL constraints, so a bug in application code cannot cause it.
+- **50 automated tests on every push.** 24 unit tests cover the booking rules and slot finding; 26 integration tests run every endpoint and error code against a real PostgreSQL (Testcontainers), including three concurrency tests: 10 parallel requests for the last slot produce exactly one booking.
+- **The build fails on warnings.** `TreatWarningsAsErrors` and nullable reference types are on, which also caught a vulnerable package (NU1903).
+- **CI on GitHub Actions** builds in Release and runs all tests against a real database on every push.
+- **The documentation was checked against the running system.** The design document was updated wherever the implementation differed from it (endpoints, error formats, metrics, the architecture diagram).
+- **Understanding is the bar for accepting code.** If I could not explain why a line was there (for example `ChangeTracker.Clear()` after a failed insert), it was not done.
+
+The main lesson: AI made me much faster, but tests, running the app myself and questioning the output are what made the result trustworthy.
+
 ## Configuration
 
 | Key | Default | |
