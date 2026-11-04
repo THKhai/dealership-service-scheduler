@@ -116,32 +116,43 @@ flowchart TD
 <div align="center">
 
 ```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 70, "rankSpacing": 70}}}%%
 flowchart TD
-    client(["Client (stubbed)<br/><small>OpenAPI · .http · cURL</small>"])
+    client(["<b>Client</b> (stubbed)<br/>OpenAPI · .http · curl"])
 
-    subgraph api["Scheduler API · .NET 10"]
-        presentation["Presentation (API)<br/><small>Endpoints · Validation · ProblemDetails</small>"]
-        business["Business (Application + Domain)<br/><small>Use cases · AvailabilityService · Rules</small>"]
-        dataAccess["Data Access (Infrastructure)<br/><small>EF Core · Migrations · Conflict mapping</small>"]
+    subgraph api["Scheduler API · .NET 10 · stateless, N instances"]
+        presentation["<b>Presentation</b><br/>Scheduler.Api<br/>Controllers · Validation<br/>ProblemDetails · Health"]
+        business["<b>Business</b><br/>Scheduler.Application<br/>AppointmentService<br/>AvailabilityService · BookingPolicy<br/>Repository interfaces"]
+        dataAccess["<b>Data Access</b><br/>Scheduler.Infrastructure<br/>EF Core repositories<br/>Migrations · 23P01 mapping"]
     end
 
-    postgres[("PostgreSQL<br/><small>Exclusion constraints</small>")]
-    observability["Observability<br/><small>OTel → Jaeger · Prometheus</small>"]
+    postgres[("<b>PostgreSQL 17</b><br/>Exclusion constraints")]
 
-    client -->|"HTTPS / JSON"| presentation
-    presentation --> business
-    business --> dataAccess
-    dataAccess --> postgres
-    api -.->|"traces · metrics · logs"| observability
+    subgraph obs["Observability"]
+        jaeger["<b>Jaeger</b><br/>traces (OTLP)"]
+        prometheus["<b>Prometheus</b><br/>metrics (OTLP)"]
+        logs["<b>stdout</b><br/>JSON logs (Serilog)"]
+    end
 
-    classDef layer fill:#ECEBFB,stroke:#5B4FC7,color:#3A2F8F
-    classDef external fill:#E1F3EC,stroke:#0F6B52,color:#0B4F3C
+    client ==>|"HTTP / JSON"| presentation
+    presentation ==>|calls| business
+    business ==>|calls| dataAccess
+    dataAccess -.->|implements| business
+    dataAccess ==> postgres
+    api -.->|telemetry| obs
+
+    classDef layer fill:#3B3470,stroke:#9D92F5,stroke-width:2px,color:#FFFFFF
+    classDef external fill:#1F4D40,stroke:#4CC79A,stroke-width:2px,color:#FFFFFF
     class presentation,business,dataAccess layer
-    class client,postgres,observability external
-    style api fill:none,stroke:#AAAAAA,stroke-dasharray:6 4
+    class client,postgres,jaeger,prometheus,logs external
+    style api fill:none,stroke:#9AA0A6,stroke-width:2px,stroke-dasharray:6 4
+    style obs fill:none,stroke:#9AA0A6,stroke-width:2px,stroke-dasharray:6 4
+    linkStyle default stroke:#B0B8C4,stroke-width:2px
 ```
 
 </div>
+
+Thick arrows show the runtime call flow; the dashed "implements" arrow shows the project reference, which points the other way: `Scheduler.Application` defines the repository interfaces and has no reference to EF Core or PostgreSQL, and `Scheduler.Infrastructure` implements them, so business rules are unit-tested without a database and the data store can be replaced without touching them (dependency inversion). The API holds no state between requests, so it scales by adding instances; booking correctness does not depend on the instance count, because PostgreSQL is the single arbiter ([section 8](#8-concurrency-and-consistency)).
 
 ## 6. Domain model
 
@@ -677,3 +688,24 @@ Requirements and test cases the AI had already drafted were treated as provision
 - AI defaults to solution-first and verbose output; results improved when I fixed the process and the audience.
 - Asking "why" and "what does this role actually do" surfaced requirements that neither the brief nor the first draft contained.
 - Facts that change over time (framework support dates) must be checked, not trusted from the AI's first answer.
+
+### 13.6 Implementation Phase
+
+I also used Claude to implement the service. The same rule applied: AI wrote code quickly, and I reviewed, tested and decided. I worked step by step (domain, rules, repositories, services, API, tests, observability) and had each step explained before moving on, so that I can explain and change every part myself.
+
+| What happened | How it was caught | Result |
+| --- | --- | --- |
+| I rewrote `BookingRules` and `BookingPolicy` myself instead of keeping the AI version | My own rewrite failed 7 unit tests: `Validate` never called the checks, and the step check used `Microsecond` instead of `Millisecond` | Fixed both; the 14 policy tests now cover every time rule, including a non-whole-minute start |
+| Parallel retries with the same `Idempotency-Key` returned `409 VEHICLE_ALREADY_BOOKED` instead of replaying the booking | Designing the parallel-retry case of the concurrency test ([8.6](#86-verification)) | The vehicle constraint can fire before the idempotency index, so the service now checks the key again before reporting a conflict ([8.4](#84-idempotency)) |
+| Concurrent first bookings for the same new email or VIN would fail with `500` | Reviewing the same race on the unique indexes | Registration reuses the row created by the concurrent request |
+| Error responses had the wrong content type (`application/json`) | Integration tests asserting `application/problem+json` | Removed the controller-level `[Produces]` attribute that overwrote it |
+| The `.http` client stub used VS Code syntax, so follow-up requests could not reuse the booked ID in Rider | Running the full stub by hand | Switched to the JetBrains HTTP Client syntax and added curl examples to the README |
+| A Kerberos library warning appeared at container start | Reading the container logs during a manual run | Disabled GSS encryption in the container connection string |
+| The architecture diagram showed Business depending on Data Access, and logs going to Jaeger | Comparing the diagram with the project references and the running app | Redrew [section 5](#5-architecture) to show dependency inversion and where each signal really goes |
+| A vulnerable transitive package (`Microsoft.OpenApi` 2.0.0, NU1903) | `TreatWarningsAsErrors` failed the build | Pinned the first patched version, 2.7.5 |
+
+What this phase confirmed:
+
+- **Tests are the real reviewer.** The most serious bug (the idempotency race) was not visible when reading the booking code; it surfaced while working out what a parallel-retry test against a real PostgreSQL should assert, and that test now guards it.
+- **Run it like a user.** Three of the issues above only appeared when running the app and the client stub by hand, not in automated tests.
+- **Understanding is the bar for accepting code.** If I could not explain why a line was there (for example `ChangeTracker.Clear()` after a failed insert), I did not accept it until I could.
